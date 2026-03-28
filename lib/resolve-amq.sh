@@ -1,4 +1,19 @@
 #!/bin/bash
+#
+# Copyright 2026 Daniele Mammarella
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Product resolver for Red Hat AMQ Broker (ActiveMQ Artemis).
 #
 # Called by initcaseenv.sh to resolve image and configuration.
@@ -16,6 +31,9 @@ _self="$0"
 [ -L "$_self" ] && _self="$(readlink -f "$_self")"
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 
+# shellcheck source=resolve-image-common.sh
+source "${SCRIPT_DIR}/resolve-image-common.sh"
+
 VERSION=""
 CACHED=""
 
@@ -24,7 +42,7 @@ while [ $# -gt 0 ]; do
     --detect-info)
       cat <<'DETECT'
 DETECT_GREP_PATTERN=\bAMQ\b|ActiveMQ|Artemis|AMQ Broker|amq-broker
-DETECT_VERSION_PATTERN=(AMQ|AMQ Broker) [0-9]+\.[0-9]+(\.[0-9]+)?
+DETECT_VERSION_PATTERN=(AMQ|AMQ Broker) [0-9]+\.[0-9]+(\.[0-9]+)*
 DETECT_DB_MODE=never
 DETECT_DEFAULT_PORTS=8161:8161,61616:61616,5672:5672
 DETECT_READY_LOG=Apache ActiveMQ Artemis.*started
@@ -39,37 +57,18 @@ done
 
 [ -z "$VERSION" ] && { echo "Error: version required." >&2; exit 1; }
 
-# AMQ Broker image: registry.redhat.io/amq7/amq-broker-rhel8
-# Tag format: <major>.<minor>-<build> (e.g. 7.12-1)
-# For simplicity, use the stream tag (e.g. 7.12) as floating tag.
-REGISTRY="registry.redhat.io"
-IMAGE_BASE="amq7/amq-broker-rhel8"
-
-# Parse version: X.Y or X.Y.Z
-IFS='.' read -r v1 v2 v3 <<< "$VERSION"
-STREAM="${v1}.${v2}"
-
+BASE_IMAGE="registry.redhat.io/amq7/amq-broker-rhel8"
 IMAGE=""
 
 if [ -n "$CACHED" ]; then
   IMAGE="$CACHED"
   echo "Using image: $IMAGE (cached)" >&2
 else
-  # Use floating stream tag (e.g. 7.12)
-  IMAGE="${REGISTRY}/${IMAGE_BASE}:${STREAM}"
   echo "Resolving AMQ Broker image for version ${VERSION}..." >&2
-
-  if command -v skopeo &>/dev/null; then
-    if skopeo inspect "docker://${IMAGE}" &>/dev/null; then
-      echo "Found image: ${IMAGE}" >&2
-    else
-      echo "Warning: cannot verify image ${IMAGE} (skopeo inspect failed)." >&2
-      echo "Make sure you are logged in: podman login ${REGISTRY}" >&2
-    fi
-  else
-    echo "Note: skopeo not available, using image tag directly." >&2
-  fi
-
+  # Live resolution via skopeo. AMQ tags follow stream format (e.g., 7.12).
+  # No version-cmd needed: tag = stream version (no mismatch).
+  IMAGE=$(_resolve_image "$BASE_IMAGE" "$VERSION") \
+    || { echo "ERROR: could not resolve AMQ Broker image." >&2; exit 1; }
   echo "Using image: $IMAGE" >&2
 fi
 
