@@ -56,6 +56,12 @@ mkdir -p "$CASES_DIR"
 # Helpers
 # ============================================================================
 
+# K8s mode: detected by KUBERNETES_SERVICE_HOST (injected by kubelet in every K8s pod).
+# When running on K8s/OpenShift, product containers run inside the AI runner Pod
+# (managed by AiService.java), not via podman-compose. initcaseenv.sh still handles
+# setup (resolve images, generate docker-compose.yml) and image builds (via BuildConfig).
+_is_k8s_mode() { [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; }
+
 # Extract a key from resolver output (set _RESOLVE_OUTPUT before calling).
 _rv() { echo "$_RESOLVE_OUTPUT" | sed -n "s/^${1}=//p"; }
 
@@ -168,6 +174,68 @@ cache_save() {
     mv "${RESOLVED_IMAGES_FILE}.tmp" "$RESOLVED_IMAGES_FILE"
   fi
   echo "${key}=${value}" >> "$RESOLVED_IMAGES_FILE"
+}
+
+# Build an image on K8s via OpenShift BuildConfig (oc start-build).
+# Creates a BuildConfig if it doesn't exist, then starts a binary build
+# uploading the Containerfile context directory.
+_k8s_build_image() {
+  local image="$1" containerfile_path="$2"
+  local bc_name
+  bc_name="initcaseenv-$(echo "$image" | tr '/:.' '-' | tr '[:upper:]' '[:lower:]')"
+  # Truncate to 63 chars (K8s name limit)
+  bc_name="${bc_name:0:63}"
+
+  local namespace
+  namespace=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "default")
+
+  # Check if image already exists in the internal registry
+  local imagestream_tag="${bc_name}:latest"
+  if oc get istag "$imagestream_tag" -n "$namespace" >/dev/null 2>&1; then
+    echo "Using image: $image (already built in cluster)"
+    _K8S_BUILT_IMAGE=$(oc get is "$bc_name" -n "$namespace" \
+      -o jsonpath='{.status.dockerImageRepository}' 2>/dev/null || echo "")
+    [ -n "$_K8S_BUILT_IMAGE" ] && _K8S_BUILT_IMAGE="${_K8S_BUILT_IMAGE}:latest"
+    return 0
+  fi
+
+  echo "Building image on OpenShift: $image (BuildConfig: ${bc_name})..."
+  local context_dir
+  context_dir=$(dirname "$containerfile_path")
+  local dockerfile_name
+  dockerfile_name=$(basename "$containerfile_path")
+
+  # Create BuildConfig if it doesn't exist
+  if ! oc get bc "$bc_name" -n "$namespace" >/dev/null 2>&1; then
+    oc new-build --name="$bc_name" \
+      --binary \
+      --strategy=docker \
+      --to="$bc_name:latest" \
+      --dockerfile="$(cat "$containerfile_path")" \
+      -n "$namespace" 2>&1 || {
+        echo "ERROR: failed to create BuildConfig '${bc_name}'." >&2
+        return 1
+      }
+  fi
+
+  # Start a binary build uploading the context directory
+  if oc start-build "$bc_name" \
+    --from-dir="$context_dir" \
+    --follow \
+    -n "$namespace" 2>&1; then
+    echo "Image $image built successfully via BuildConfig."
+    # Return internal registry image path via _K8S_BUILT_IMAGE
+    # Caller uses this to update compose file with the correct image reference
+    _K8S_BUILT_IMAGE=$(oc get is "$bc_name" -n "$namespace" \
+      -o jsonpath='{.status.dockerImageRepository}' 2>/dev/null || echo "")
+    if [ -n "$_K8S_BUILT_IMAGE" ]; then
+      _K8S_BUILT_IMAGE="${_K8S_BUILT_IMAGE}:latest"
+      echo "  Internal image: ${_K8S_BUILT_IMAGE}"
+    fi
+  else
+    echo "ERROR: BuildConfig build failed for '${bc_name}'." >&2
+    return 1
+  fi
 }
 
 get_exposed_ports() {
@@ -459,7 +527,14 @@ _add_service() {
   # Build image if needed (RESOLVE_CONTAINERFILE non-empty = build required)
   if [ -n "$r_containerfile" ]; then
     local containerfile_path="${INITCASEENV_DIR}/${r_containerfile}"
-    if podman image exists "$r_image" 2>/dev/null; then
+    if _is_k8s_mode; then
+      _K8S_BUILT_IMAGE=""
+      _k8s_build_image "$r_image" "$containerfile_path"
+      # Use the internal registry image in compose (so runner Pod pulls the right image)
+      if [ -n "$_K8S_BUILT_IMAGE" ]; then
+        r_image="$_K8S_BUILT_IMAGE"
+      fi
+    elif podman image exists "$r_image" 2>/dev/null; then
       echo "Using image: $r_image (already present)"
     else
       echo "Building image: $r_image ..."
@@ -696,16 +771,18 @@ _remove_service_from_compose() {
   parsed=$(_parse_container_name "$target_container")
   local rm_type="${parsed%% *}"
 
-  # Stop and remove the specific containers
+  # Stop and remove the specific containers (skip on K8s — no local podman)
   local postgres_name="postgres-${rm_type}-${CASEID}"
-  for cn in "$target_container" "$postgres_name"; do
-    if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cn"; then
-      podman stop "$cn" >/dev/null 2>&1 || true
-    fi
-    if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$cn"; then
-      podman rm "$cn" >/dev/null 2>&1 || true
-    fi
-  done
+  if ! _is_k8s_mode; then
+    for cn in "$target_container" "$postgres_name"; do
+      if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cn"; then
+        podman stop "$cn" >/dev/null 2>&1 || true
+      fi
+      if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$cn"; then
+        podman rm "$cn" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
 
   # Remove service from compose via python
   python3 -c "
@@ -941,6 +1018,15 @@ do_start() {
     return 1
   fi
 
+  # K8s mode: product containers run inside the AI runner Pod (managed by AiService.java).
+  # initcaseenv.sh only generates docker-compose.yml — AiService reads it to build the Pod spec.
+  if _is_k8s_mode; then
+    echo "K8s mode: product containers will start with the next AI run (runner Pod)."
+    echo "  Compose file: ${compose_file}"
+    _ALREADY_RUNNING=""
+    return 0
+  fi
+
   # Track which containers were already running before start
   _ALREADY_RUNNING=""
   local containers
@@ -979,8 +1065,16 @@ do_start() {
 }
 
 _health_check_endpoint() {
-  local proto="$1" host_port="$2" path="$3" label="$4"
-  local url="${proto}://localhost:${host_port}${path}"
+  local proto="$1" host_port="$2" path="$3" label="$4" container="${5:-}"
+  # Use container IP if available (when running inside another container),
+  # fall back to localhost (bare-metal or host)
+  local target="localhost"
+  if [ -n "$container" ]; then
+    local cip
+    cip=$(podman inspect "$container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+    [ -n "$cip" ] && target="$cip"
+  fi
+  local url="${proto}://${target}:${host_port}${path}"
   local curl_args=(-s -o /dev/null -w '%{http_code}' --max-time 5)
   [ "$proto" = "https" ] && curl_args+=(-k)
 
@@ -995,6 +1089,9 @@ _health_check_endpoint() {
 }
 
 do_health_check() {
+  # K8s mode: health checks run inside the runner Pod (AiService manages readiness)
+  if _is_k8s_mode; then return 0; fi
+
   echo "==> Health check..."
 
   local containers
@@ -1068,13 +1165,16 @@ do_health_check() {
     IFS=',' read -ra checks <<< "$checks_str"
     for check in "${checks[@]}"; do
       IFS=':' read -r proto container_port path <<< "$check"
-      local host_port="$container_port"
-      # Lookup port in map
-      local _pm
-      for _pm in $_port_map; do
-        [ "${_pm%%=*}" = "$container_port" ] && host_port="${_pm#*=}" && break
-      done
-      if ! _health_check_endpoint "$proto" "$host_port" "$path" "${type} ${version}"; then
+      local check_port="$container_port"
+      if [ -z "${KUBERNETES_SERVICE_HOST:-}" ]; then
+        # Not on K8s — use container IP + container port (works from agent container or host)
+        # Fall back to host-mapped port with localhost if no container IP
+        local _pm
+        for _pm in $_port_map; do
+          [ "${_pm%%=*}" = "$container_port" ] && check_port="${_pm#*=}" && break
+        done
+      fi
+      if ! _health_check_endpoint "$proto" "$check_port" "$path" "${type} ${version}" "$cname"; then
         all_pass=false
       fi
     done
@@ -1088,6 +1188,9 @@ do_health_check() {
 }
 
 do_post_start() {
+  # K8s mode: post-start handled by AiService runner Pod lifecycle hooks
+  if _is_k8s_mode; then _POST_START_RAN=false; return 0; fi
+
   # Re-resolve post-start commands from resolvers (no cached CONF_POST_START_CMDS).
   local containers
   containers=$(_get_service_containers)
@@ -1154,6 +1257,13 @@ do_stop() {
     return 1
   fi
 
+  # K8s mode: product containers run inside runner Pod, managed by AiService
+  if _is_k8s_mode; then
+    echo "K8s mode: product containers are managed by the runner Pod."
+    echo "  Use the agent API or delete the runner Pod to stop containers."
+    return 0
+  fi
+
   if [ $# -eq 0 ]; then
     # Stop all via compose down
     if $(_compose_base) down >/dev/null 2>&1; then
@@ -1179,6 +1289,9 @@ do_stop() {
 }
 
 do_restart() {
+  # K8s mode: delegate to do_stop (which prints the K8s message)
+  if _is_k8s_mode; then do_stop; return $?; fi
+
   if [ $# -eq 0 ]; then
     # Restart all via compose
     local containers
@@ -1235,6 +1348,27 @@ do_status() {
     return
   fi
 
+  # K8s mode: show configured services from compose file (no podman inspect)
+  if _is_k8s_mode; then
+    echo "  Mode: Kubernetes (product containers run inside runner Pod)"
+    echo ""
+    echo "  Configured services:"
+    while IFS= read -r cname; do
+      [ -z "$cname" ] && continue
+      [[ "$cname" == postgres-* ]] && continue
+      local parsed
+      parsed=$(_parse_container_name "$cname")
+      local stype="${parsed%% *}" sversion="${parsed#* }"
+      echo "    ${stype} ${sversion} (${cname})"
+    done <<< "$targets"
+    # Show DB
+    while IFS= read -r cname; do
+      [ -z "$cname" ] && continue
+      [[ "$cname" == postgres-* ]] && echo "    db: ${cname}"
+    done <<< "$targets"
+    return
+  fi
+
   echo "  Services:"
   while IFS= read -r cname; do
     [ -z "$cname" ] && continue
@@ -1267,6 +1401,28 @@ do_status() {
 }
 
 do_logs() {
+  # K8s mode: logs are available via kubectl logs on the runner Pod
+  if _is_k8s_mode; then
+    local namespace
+    namespace=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "default")
+    echo "K8s mode: product container logs are in the runner Pod."
+    echo "  Use: kubectl logs <runner-pod> -c <container> -n ${namespace}"
+    # List runner pods for this case
+    local pods
+    pods=$(kubectl get pods -n "$namespace" -l "initcaseenv.io/case=${CASEID}" \
+      --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null || true)
+    if [ -n "$pods" ]; then
+      echo "  Active runner pods:"
+      while IFS= read -r pod; do
+        [ -z "$pod" ] && continue
+        echo "    ${pod}"
+      done <<< "$pods"
+    else
+      echo "  No active runner pods for case ${CASEID}."
+    fi
+    return 0
+  fi
+
   local targets
   if [ $# -gt 0 ]; then
     targets=$(_resolve_target_containers "$@") || return 1
@@ -1299,7 +1455,23 @@ do_exec() {
     done <<< "$all_containers"
     return 1
   fi
-  podman exec "$container" "$@"
+
+  # K8s mode: exec into the container running inside the runner Pod
+  if _is_k8s_mode; then
+    local namespace
+    namespace=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "default")
+    # Find the runner pod for this case
+    local pod
+    pod=$(kubectl get pods -n "$namespace" -l "initcaseenv.io/case=${CASEID}" \
+      --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | head -1)
+    if [ -z "$pod" ]; then
+      echo "Error: no active runner pod for case ${CASEID}." >&2
+      return 1
+    fi
+    kubectl exec -n "$namespace" "$pod" -c "$container" -- "$@"
+  else
+    podman exec "$container" "$@"
+  fi
 }
 
 do_rm() {
@@ -1308,6 +1480,30 @@ do_rm() {
 
   if [ ! -f "$(_compose_file)" ]; then
     echo "No environment configured for case ${CASEID}." >&2
+    return 0
+  fi
+
+  # K8s mode: only manage compose file and BuildConfig resources (no podman containers)
+  if _is_k8s_mode; then
+    if [ "$rm_all" = true ] && [ $# -eq 0 ]; then
+      # Delete runner pods for this case
+      local namespace
+      namespace=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "default")
+      kubectl delete pods -n "$namespace" -l "initcaseenv.io/case=${CASEID}" --ignore-not-found 2>/dev/null || true
+      rm -f "$(_compose_file)"
+      rm -f "${INITCASEENV_DIR}/buildenv-${CASEID}-howto.txt"
+      echo "Configuration and runner pods removed for case ${CASEID}."
+    elif [ $# -gt 0 ]; then
+      local targets
+      targets=$(_resolve_target_service_containers "$@") || return 1
+      while IFS= read -r cname; do
+        [ -z "$cname" ] && continue
+        _remove_service_from_compose "$cname"
+      done <<< "$targets"
+    else
+      echo "K8s mode: no running containers to stop (managed by runner Pod)."
+      echo "  Use --all to remove configuration."
+    fi
     return 0
   fi
 
