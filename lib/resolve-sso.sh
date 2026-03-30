@@ -1,4 +1,19 @@
 #!/bin/bash
+#
+# Copyright 2026 Daniele Mammarella
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Product resolver for Red Hat Single Sign-On (RHSSO / Keycloak 7.x).
 #
 # Called by initcaseenv.sh to resolve image and configuration.
@@ -12,6 +27,13 @@
 
 set -euo pipefail
 
+_self="$0"
+[ -L "$_self" ] && _self="$(readlink -f "$_self")"
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+
+# shellcheck source=resolve-image-common.sh
+source "${SCRIPT_DIR}/resolve-image-common.sh"
+
 VERSION=""
 CACHED=""
 
@@ -20,7 +42,7 @@ while [ $# -gt 0 ]; do
     --detect-info)
       cat <<'DETECT'
 DETECT_GREP_PATTERN=\bRHSSO\b|\bSSO\b|Red Hat Single Sign-On|sso7[0-9]|RH-SSO
-DETECT_VERSION_PATTERN=(RHSSO|RH-SSO|SSO) [0-9]+\.[0-9]+(\.[0-9]+)?
+DETECT_VERSION_PATTERN=(RHSSO|RH-SSO|SSO) [0-9]+\.[0-9]+(\.[0-9]+)*
 DETECT_DB_MODE=always
 DETECT_DEFAULT_PORTS=8080:8080,8443:8443
 DETECT_READY_LOG=WFLYSRV0025.*started in
@@ -35,14 +57,10 @@ done
 
 [ -z "$VERSION" ] && { echo "Error: version required." >&2; exit 1; }
 
-# RHSSO image: registry.redhat.io/rh-sso-7/sso76-openshift-rhel8
-# Version format: 7.6 → sso76, tag = 7.6 or 7.6-NN
-IFS='.' read -r v_major v_minor v_patch <<< "$VERSION"
-STREAM="${v_major}.${v_minor}"
+# RHSSO image path depends on version: rh-sso-7/sso76-openshift-rhel8
+IFS='.' read -r v_major v_minor _ <<< "$VERSION"
 SSO_TAG="sso${v_major}${v_minor}"
-
-REGISTRY="registry.redhat.io"
-IMAGE_BASE="rh-sso-7/${SSO_TAG}-openshift-rhel8"
+BASE_IMAGE="registry.redhat.io/rh-sso-7/${SSO_TAG}-openshift-rhel8"
 
 IMAGE=""
 
@@ -50,25 +68,11 @@ if [ -n "$CACHED" ]; then
   IMAGE="$CACHED"
   echo "Using image: $IMAGE (cached)" >&2
 else
-  # If patch/build number provided (e.g. 7.6-73), use it as tag
-  if [ -n "$v_patch" ]; then
-    IMAGE="${REGISTRY}/${IMAGE_BASE}:${STREAM}-${v_patch}"
-  else
-    IMAGE="${REGISTRY}/${IMAGE_BASE}:${STREAM}"
-  fi
   echo "Resolving RHSSO image for version ${VERSION}..." >&2
-
-  if command -v skopeo &>/dev/null; then
-    if skopeo inspect "docker://${IMAGE}" &>/dev/null; then
-      echo "Found image: ${IMAGE}" >&2
-    else
-      echo "Warning: cannot verify image ${IMAGE} (skopeo inspect failed)." >&2
-      echo "Make sure you are logged in: podman login ${REGISTRY}" >&2
-    fi
-  else
-    echo "Note: skopeo not available, using image tag directly." >&2
-  fi
-
+  # Live resolution via skopeo. SSO tags follow stream format (e.g., 7.6, 7.6-73).
+  # No version-cmd needed: tag = stream version.
+  IMAGE=$(_resolve_image "$BASE_IMAGE" "$VERSION") \
+    || { echo "ERROR: could not resolve RHSSO image." >&2; exit 1; }
   echo "Using image: $IMAGE" >&2
 fi
 

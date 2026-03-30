@@ -1,4 +1,19 @@
 #!/bin/bash
+#
+# Copyright 2026 Daniele Mammarella
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Product resolver for Red Hat build of Keycloak (RHBK).
 #
 # Called by initcaseenv.sh to resolve image and configuration.
@@ -16,6 +31,9 @@ _self="$0"
 [ -L "$_self" ] && _self="$(readlink -f "$_self")"
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 
+# shellcheck source=resolve-image-common.sh
+source "${SCRIPT_DIR}/resolve-image-common.sh"
+
 VERSION=""
 CACHED=""
 
@@ -24,7 +42,7 @@ while [ $# -gt 0 ]; do
     --detect-info)
       cat <<'DETECT'
 DETECT_GREP_PATTERN=\bKeycloak\b|\bRHBK\b|Red Hat build of Keycloak|kcadm
-DETECT_VERSION_PATTERN=(Keycloak|RHBK) [0-9]+\.[0-9]+(\.[0-9]+)?
+DETECT_VERSION_PATTERN=(Keycloak|RHBK) [0-9]+\.[0-9]+(\.[0-9]+)*
 DETECT_DB_MODE=always
 DETECT_DEFAULT_PORTS=8080:8080,8443:8443
 DETECT_READY_LOG=Listening on: http://
@@ -39,6 +57,7 @@ done
 
 [ -z "$VERSION" ] && { echo "Error: version required." >&2; exit 1; }
 
+BASE_IMAGE="registry.redhat.io/rhbk/keycloak-rhel9"
 IMAGE=""
 
 if [ -n "$CACHED" ]; then
@@ -46,10 +65,10 @@ if [ -n "$CACHED" ]; then
   echo "Using image: $IMAGE (cached)" >&2
 else
   echo "Resolving RHBK image for version ${VERSION}..." >&2
-  image_output=$("${SCRIPT_DIR}/get-rhbk-image.sh" "$VERSION") \
+  # Live resolution: fast tag patterns, then skopeo cycling fallback.
+  # version-cmd: Keycloak outputs "Keycloak 26.4.5.redhat-00001" with --version.
+  IMAGE=$(_resolve_image "$BASE_IMAGE" "$VERSION" "--version" '[0-9]+\.[0-9]+\.[0-9]+') \
     || { echo "ERROR: could not resolve RHBK image." >&2; exit 1; }
-  IMAGE=$(echo "$image_output" | grep -v '^#' | tail -1)
-  echo "Found image version: ${IMAGE##*/}" >&2
   echo "Using image: $IMAGE" >&2
 fi
 

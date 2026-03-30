@@ -1,8 +1,23 @@
 #!/bin/bash
+#
+# Copyright 2026 Daniele Mammarella
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Initialize and manage containerized case environments with podman.
 #
 # Product resolution is handled by plug-in resolver scripts in lib/:
-#   lib/resolve-<type>.sh    (e.g. resolve-rhbk.sh, resolve-eap.sh)
+# lib/resolve-<type>.sh    (e.g. resolve-rhbk.sh, resolve-eap.sh)
 # Adding a new product type only requires creating a new resolver script.
 #
 # Resolved images/channels are cached in $CASES_DIR/.resolved-images
@@ -12,19 +27,20 @@
 # The docker-compose.yml in initcaseenv-data/ is the source of truth.
 #
 # Flows:
-#   script <CASEID> setup [-t -v [-d] [-e K=V] [-p H:C]]  Add service (no start)
-#   script <CASEID> start [-t -v [-d] [-e K=V] [-p H:C]]  Add service + start all
-#   script <CASEID> setup -m FILE                          Add services from JSON (no start)
-#   script <CASEID> start -m FILE                          Add services from JSON + start all
-#   script <CASEID> exec    CONTAINER CMD [ARG...]           Run command inside container
-#   script <CASEID> stop    [CONTAINER...]                  Stop containers
-#   script <CASEID> restart [CONTAINER...]                  Restart containers
-#   script <CASEID> rm      [CONTAINER...] [--all]         Remove containers or everything
-#   script <CASEID> status  [CONTAINER...]                  Show status
-#   script <CASEID> logs    [CONTAINER...]                  Show container logs
-#   script <CASEID> healthcheck [CONTAINER...]              Run health checks
+# script <CASEID> setup [-t -v [-d] [-e K=V] [-p H:C]]  Add service (no start)
+# script <CASEID> start [-t -v [-d] [-e K=V] [-p H:C]]  Add service + start all
+# script <CASEID> setup -m FILE                          Add services from JSON (no start)
+# script <CASEID> start -m FILE                          Add services from JSON + start all
+# script <CASEID> exec    CONTAINER CMD [ARG...]           Run command inside container
+# script <CASEID> stop    [CONTAINER...]                  Stop containers
+# script <CASEID> restart [CONTAINER...]                  Restart containers
+# script <CASEID> rm      [CONTAINER...] [--all]         Remove containers or everything
+# script <CASEID> status  [CONTAINER...]                  Show status
+# script <CASEID> logs    [CONTAINER...]                  Show container logs
+# script <CASEID> healthcheck [CONTAINER...]              Run health checks
 #
 # Author: Daniele Mammarella <dmammare@redhat.com>
+#
 
 set -euo pipefail
 
@@ -32,7 +48,7 @@ _self="$0"
 [ -L "$_self" ] && _self="$(readlink -f "$_self")"
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 
-CASES_DIR="${CASES_DIR:-$HOME/cases}"
+CASES_DIR="${CASES_DIR:-/opt/initcaseenv/data}"
 INITCASEENV_SUBDIR="${INITCASEENV_SUBDIR:-initcaseenv-data}"
 mkdir -p "$CASES_DIR"
 
@@ -55,8 +71,8 @@ _resolve_type() {
   t=$(echo "$1" | tr '[:upper:]' '[:lower:]')
   local aliases_file
   for aliases_file in \
-    "${SCRIPT_DIR}/../product-aliases.conf" \
-    "${SCRIPT_DIR}/../../product-aliases.conf"; do
+    "${SCRIPT_DIR}/../../config/product-aliases.conf" \
+    "${SCRIPT_DIR}/../product-aliases.conf"; do
     [ -f "$aliases_file" ] || continue
     local line
     while IFS= read -r line; do
@@ -240,7 +256,24 @@ _get_all_containers() {
     | awk '{print $2}' || true
 }
 
-# Extract type and version from a container name (e.g. "rhbk-2647-04393780" → "rhbk" "26.4.7").
+# Warn about ignored flags when reusing an existing container.
+_warn_ignored_flags() {
+  local cname="$1"
+  if [ "$with_db" = "true" ] || [ -n "$custom_ports" ] || [ -n "$custom_envs" ] \
+     || [ -n "$custom_command" ] || [ -n "$custom_post_start" ] \
+     || [ -n "$custom_db_name" ] || [ -n "$custom_db_user" ]; then
+    local diff_flags=""
+    [ "$with_db" = "true" ] && diff_flags+="-d "
+    [ -n "$custom_ports" ] && diff_flags+="-p "
+    [ -n "$custom_envs" ] && diff_flags+="-e "
+    [ -n "$custom_command" ] && diff_flags+="-c "
+    [ -n "$custom_post_start" ] && diff_flags+="--post-start "
+    echo "  NOTE: ${diff_flags}flags ignored — existing container retains its original configuration."
+    echo "  To apply new configuration: rm ${cname}, then re-add."
+  fi
+}
+
+# Extract type and version from a container name (e.g. "rhbk-2647-12345678" → "rhbk" "26.4.7").
 # Convention: <prefix>-<version_nodots>-<caseid>
 _parse_container_name() {
   local cname="$1"
@@ -284,6 +317,9 @@ _parse_container_name() {
 }
 
 # Check if a service with given type+version already exists in compose.
+# Matches by the full container name ({prefix}-{version_nodots}-{CASEID})
+# so alias types (eap / red-hat-enterprise-application-platform) with the
+# same RESOLVE_CONTAINER_PREFIX are correctly detected as duplicates.
 # Args: type version
 _service_exists_in_compose() {
   local type="$1" version="${2:-}"
@@ -292,13 +328,28 @@ _service_exists_in_compose() {
   containers=$(_get_service_containers)
   [ -z "$containers" ] && return 1
 
+  # Resolve the prefix for the requested type
+  local resolver="${SCRIPT_DIR}/lib/resolve-${type}.sh"
+  if [ -f "$resolver" ] && [ -n "$version" ]; then
+    local req_prefix
+    _RESOLVE_OUTPUT=$("$resolver" "0.0" --cached "dummy" 2>/dev/null) || true
+    req_prefix=$(_rv RESOLVE_CONTAINER_PREFIX 2>/dev/null) || req_prefix=""
+    if [ -n "$req_prefix" ]; then
+      local expected_cname="${req_prefix}-${version//./}-${CASEID}"
+      while IFS= read -r cname; do
+        [ "$cname" = "$expected_cname" ] && return 0
+      done <<< "$containers"
+      return 1
+    fi
+  fi
+
+  # Fallback: match by parsed type name
   while IFS= read -r cname; do
     local parsed
     parsed=$(_parse_container_name "$cname")
     local existing_type="${parsed%% *}"
     local existing_version="${parsed#* }"
     if [ "$existing_type" = "$type" ]; then
-      # If version specified, match both; otherwise match type only
       if [ -z "$version" ] || [ "${version//./}" = "${existing_version//./}" ]; then
         return 0
       fi
@@ -336,41 +387,31 @@ _add_service() {
 
   # Check if already exists (same type + same version)
   if _service_exists_in_compose "$type" "$version"; then
-    # Find the container name and its podman state
+    # Build the expected container name to find it
     local existing_cname=""
-    while IFS= read -r ecname; do
-      local ep
-      ep=$(_parse_container_name "$ecname")
-      local etype="${ep%% *}" eversion="${ep#* }"
-      if [ "$etype" = "$type" ] && [ "${eversion//./}" = "${version//./}" ]; then
-        existing_cname="$ecname"
-        break
-      fi
-    done <<< "$(_get_service_containers)"
+    local _tmp_prefix=""
+    local _tmp_resolver="${SCRIPT_DIR}/lib/resolve-${type}.sh"
+    if [ -f "$_tmp_resolver" ]; then
+      _RESOLVE_OUTPUT=$("$_tmp_resolver" "0.0" --cached "dummy" 2>/dev/null) || true
+      _tmp_prefix=$(_rv RESOLVE_CONTAINER_PREFIX 2>/dev/null) || _tmp_prefix=""
+    fi
+    if [ -n "$_tmp_prefix" ]; then
+      existing_cname="${_tmp_prefix}-${version//./}-${CASEID}"
+    fi
     local cstate
     cstate=$(podman inspect --format '{{.State.Status}}' "$existing_cname" 2>/dev/null || echo "not found")
     case "$cstate" in
       running)
-        echo "Service ${type} ${version} already running (${existing_cname}), reusing." ;;
+        echo "Service ${type} ${version} already running (${existing_cname}), reusing."
+        _warn_ignored_flags "$existing_cname" ;;
       exited|stopped)
-        echo "Service ${type} ${version} exists but stopped (${existing_cname}), will be restarted." ;;
+        echo "Service ${type} ${version} exists but stopped (${existing_cname}), will be restarted."
+        _warn_ignored_flags "$existing_cname" ;;
       *)
-        echo "Service ${type} ${version} in configuration but container not found (${existing_cname}), will be recreated." ;;
+        existing_cname=""
+        echo "Service ${type} ${version} container not found, will be created." ;;
     esac
-    # Warn if new flags differ from existing config
-    if [ "$with_db" = "true" ] || [ -n "$custom_ports" ] || [ -n "$custom_envs" ] \
-       || [ -n "$custom_command" ] || [ -n "$custom_post_start" ] \
-       || [ -n "$custom_db_name" ] || [ -n "$custom_db_user" ]; then
-      local diff_flags=""
-      [ "$with_db" = "true" ] && diff_flags+="-d "
-      [ -n "$custom_ports" ] && diff_flags+="-p "
-      [ -n "$custom_envs" ] && diff_flags+="-e "
-      [ -n "$custom_command" ] && diff_flags+="-c "
-      [ -n "$custom_post_start" ] && diff_flags+="--post-start "
-      echo "  NOTE: ${diff_flags}flags ignored — existing container retains its original configuration."
-      echo "  To apply new configuration: rm ${existing_cname}, then re-add."
-    fi
-    return 0
+    [ -n "$existing_cname" ] && return 0
   fi
 
   local resolver="${SCRIPT_DIR}/lib/resolve-${type}.sh"

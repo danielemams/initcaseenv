@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Product resolver for JBoss EAP.
+# Product resolver for Red Hat Enterprise Application Platform (JBoss EAP).
 #
 # Called by initcaseenv.sh to resolve image and configuration.
 # Output (stdout): RESOLVE_* variable assignments (sourced by caller).
@@ -23,8 +23,8 @@
 # Supports EAP 8.x (Galleon channel, local image build) and
 # EAP 7.x (pre-built registry image, no build needed).
 #
-# Usage: resolve-eap.sh <version> [--cached VALUE] [--env-dir DIR]
-#        resolve-eap.sh --detect-info
+# Usage: resolve-red-hat-enterprise-application-platform.sh <version> [--cached VALUE] [--env-dir DIR]
+#        resolve-red-hat-enterprise-application-platform.sh --detect-info
 #
 # Author: Daniele Mammarella <dmammare@redhat.com>
 
@@ -60,9 +60,6 @@ done
 
 IFS='.' read -r EAP_MAJOR EAP_MINOR _ <<< "$VERSION"
 
-# Resolve channel/feature-pack via get-eap-channel.sh (or use cached value).
-# Usage: _resolve_channel <label> <fatal: true|false>
-# Sets CHANNEL_ENV_LINE on success.
 _resolve_channel() {
   local label="$1" fatal="$2"
   if [ -n "$CACHED" ]; then
@@ -71,7 +68,7 @@ _resolve_channel() {
   fi
   echo "Resolving EAP ${label} for version ${VERSION}..." >&2
   local channel_output
-  if channel_output=$("${SCRIPT_DIR}/get-eap-channel.sh" "$VERSION"); then
+  if channel_output="$("${SCRIPT_DIR}/get-eap-channel.sh" "$VERSION")"; then
     CHANNEL_ENV_LINE=$(echo "$channel_output" | grep -v '^#' | tail -1)
     local resolved_info
     resolved_info=$(echo "$channel_output" | grep '^#' | head -1)
@@ -91,18 +88,14 @@ CHANNEL_ENV_LINE=""
 CONTAINERFILE_NAME=""
 
 if [ "$EAP_MAJOR" = "7" ]; then
-  # EAP 7: pre-built image from registry
   IMAGE="registry.redhat.io/jboss-eap-7/eap7${EAP_MINOR}-openjdk11-openshift-rhel8:latest"
   _resolve_channel "feature-pack" false
   echo "Using image: $IMAGE (pre-built, no build needed)" >&2
-
 else
-  # EAP 8: local build with Galleon channel
   IMAGE="localhost/eap-${VERSION}"
   CONTAINERFILE_NAME="Containerfile-eap-${VERSION}"
   _resolve_channel "channel" true
 
-  # Generate Containerfile if env-dir provided
   if [ -n "$ENV_DIR" ]; then
     cat > "${ENV_DIR}/${CONTAINERFILE_NAME}" <<'CEOF'
 FROM registry.redhat.io/jboss-eap-8/eap81-openjdk21-builder-openshift-rhel9:latest AS builder
@@ -118,7 +111,6 @@ RUN /usr/local/s2i/assemble
 FROM registry.redhat.io/jboss-eap-8/eap81-openjdk21-runtime-openshift-rhel9:latest AS runtime
 
 COPY --from=builder --chown=jboss:root $JBOSS_HOME $JBOSS_HOME
-#COPY --chown=jboss:root ./target/test-app.war $JBOSS_HOME/standalone/deployments
 
 RUN chmod -R ug+rwX $JBOSS_HOME
 CEOF
