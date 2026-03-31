@@ -258,7 +258,7 @@ _used_host_ports() {
   {
     # Ports from running containers
     podman ps --format '{{.Ports}}' 2>/dev/null \
-      | sed -n 's/.*:\([0-9]*\)->.*/\1/p'
+      | tr ',' '\n' | sed -n 's/.*:\([0-9]*\)->.*/\1/p'
     # Ports already allocated in our compose file (even if container not running)
     if [ -f "$(_compose_file)" ]; then
       sed -n 's/^[[:space:]]*-[[:space:]]*"\([0-9]*\):.*/\1/p' "$(_compose_file)"
@@ -475,6 +475,12 @@ _add_service() {
       exited|stopped)
         echo "Service ${type} ${version} exists but stopped (${existing_cname}), will be restarted."
         _warn_ignored_flags "$existing_cname" ;;
+      created)
+        # Container was created but never started (e.g. port conflict after agent restart).
+        # Remove it and its compose entry so it gets recreated with fresh ports.
+        echo "Service ${type} ${version} stuck in 'created' state (${existing_cname}), recreating."
+        _remove_service_from_compose "$existing_cname"
+        existing_cname="" ;;
       *)
         existing_cname=""
         echo "Service ${type} ${version} container not found, will be created." ;;
@@ -1065,16 +1071,16 @@ do_start() {
 }
 
 _health_check_endpoint() {
-  local proto="$1" host_port="$2" path="$3" label="$4" container="${5:-}"
-  # Use container IP if available (when running inside another container),
-  # fall back to localhost (bare-metal or host)
+  local proto="$1" host_port="$2" path="$3" label="$4"
+  # When running inside a container, use host.containers.internal to reach
+  # host-mapped ports (localhost inside the container is the container itself,
+  # not the host). On bare-metal, use localhost directly.
   local target="localhost"
-  if [ -n "$container" ]; then
-    local cip
-    cip=$(podman inspect "$container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
-    [ -n "$cip" ] && target="$cip"
+  if [ -n "${CONTAINER_HOST:-}" ]; then
+    target="host.containers.internal"
   fi
-  local url="${proto}://${target}:${host_port}${path}"
+  local port="$host_port"
+  local url="${proto}://${target}:${port}${path}"
   local curl_args=(-s -o /dev/null -w '%{http_code}' --max-time 5)
   [ "$proto" = "https" ] && curl_args+=(-k)
 
@@ -1174,7 +1180,7 @@ do_health_check() {
           [ "${_pm%%=*}" = "$container_port" ] && check_port="${_pm#*=}" && break
         done
       fi
-      if ! _health_check_endpoint "$proto" "$check_port" "$path" "${type} ${version}" "$cname"; then
+      if ! _health_check_endpoint "$proto" "$check_port" "$path" "${type} ${version}"; then
         all_pass=false
       fi
     done
